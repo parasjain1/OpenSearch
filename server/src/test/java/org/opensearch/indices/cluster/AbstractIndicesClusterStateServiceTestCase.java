@@ -59,6 +59,9 @@ import org.opensearch.indices.cluster.IndicesClusterStateService.Shard;
 import org.opensearch.indices.recovery.PeerRecoveryTargetService;
 import org.opensearch.indices.recovery.RecoveryListener;
 import org.opensearch.indices.recovery.RecoveryState;
+import org.opensearch.indices.recovery.StartRecoveryRequest;
+import org.opensearch.indices.recovery.inplacesplit.InPlaceShardSplitRecoveryListener;
+import org.opensearch.indices.recovery.inplacesplit.InPlaceShardSplitRecoveryService;
 import org.opensearch.indices.replication.checkpoint.SegmentReplicationCheckpointPublisher;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.test.OpenSearchTestCase;
@@ -275,6 +278,27 @@ public abstract class AbstractIndicesClusterStateServiceTestCase extends OpenSea
         }
 
         @Override
+        public void createChildShardsForSplit(
+            List<ShardRouting> shardRoutings,
+            ShardId parentShardId,
+            InPlaceShardSplitRecoveryService inPlaceShardSplitRecoveryService,
+            InPlaceShardSplitRecoveryListener recoveryListener,
+            Consumer<IndexShard.ShardFailure> onShardFailure,
+            DiscoveryNode node,
+            Consumer<ShardId> globalCheckpointSyncer,
+            RetentionLeaseSyncer retentionLeaseSyncer,
+            SegmentReplicationCheckpointPublisher checkpointPublisher,
+            RemoteStoreStatsTrackerFactory remoteStoreStatsTrackerFactory,
+            StartRecoveryRequest request) throws IOException {
+
+        }
+
+        @Override
+        public void moveChildShardsToStarted(ShardId parentShardId, InPlaceShardSplitRecoveryService inPlaceShardSplitRecoveryService) {
+
+        }
+
+        @Override
         public void processPendingDeletes(Index index, IndexSettings indexSettings, TimeValue timeValue) throws IOException,
             InterruptedException {
 
@@ -422,6 +446,11 @@ public abstract class AbstractIndicesClusterStateServiceTestCase extends OpenSea
         @Override
         public ShardRouting routingEntry() {
             return shardRouting;
+        }
+
+        @Override
+        public ShardId getParentShardId() {
+            return null;
         }
 
         @Override

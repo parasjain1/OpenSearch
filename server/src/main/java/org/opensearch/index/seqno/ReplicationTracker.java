@@ -136,7 +136,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
 
     /**
      * Boolean flag that indicates if a relocation handoff is in progress. A handoff is started by calling
-     * {@link #startRelocationHandoff(String)} and is finished by either calling {@link #completeRelocationHandoff} or
+     * {@link #startRelocationHandoff(Set)}  and is finished by either calling {@link #completeRelocationHandoff} or
      * {@link #abortRelocationHandoff}, depending on whether the handoff was successful or not. During the handoff, which has as main
      * objective to transfer the internal state of the global checkpoint tracker from the relocation source to the target, the list of
      * in-sync shard copies cannot grow, otherwise the relocation target might miss this information and increase the global checkpoint
@@ -896,7 +896,10 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
         // when in primary mode, the current allocation ID is the allocation ID of the primary or the relocation allocation ID
         assert !primaryMode
             || (routingTable.primaryShard().allocationId().getId().equals(shardAllocationId)
-                || routingTable.primaryShard().allocationId().getRelocationId().equals(shardAllocationId));
+                || routingTable.primaryShard().allocationId().getRelocationId() != null &&
+            routingTable.primaryShard().allocationId().getRelocationId().equals(shardAllocationId) ||
+            routingTable.primaryShard().allocationId().getSplitChildAllocationIds() != null &&
+                routingTable.primaryShard().allocationId().getSplitChildAllocationIds().contains(shardAllocationId));
 
         // during relocation handoff there are no entries blocking global checkpoint advancement
         assert !handoffInProgress || pendingInSync.isEmpty() : "entries blocking global checkpoint advancement during relocation handoff: "
@@ -906,9 +909,9 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
         assert pendingInSync.isEmpty() || (primaryMode && !handoffInProgress);
 
         // the computed global checkpoint is always up-to-date
-        assert !primaryMode || globalCheckpoint == computeGlobalCheckpoint(pendingInSync, checkpoints.values(), globalCheckpoint)
+        assert !primaryMode || globalCheckpoint == computeGlobalCheckpoint(pendingInSync, checkpoints, globalCheckpoint)
             : "global checkpoint is not up-to-date, expected: "
-                + computeGlobalCheckpoint(pendingInSync, checkpoints.values(), globalCheckpoint)
+                + computeGlobalCheckpoint(pendingInSync, checkpoints, globalCheckpoint)
                 + " but was: "
                 + globalCheckpoint;
 
@@ -957,7 +960,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
             // all tracked shard copies have a corresponding peer-recovery retention lease
             for (final ShardRouting shardRouting : routingTable.assignedShards()) {
                 final CheckpointState cps = checkpoints.get(shardRouting.allocationId().getId());
-                if (cps.tracked && cps.replicated) {
+                if (cps.tracked && cps.replicated && shardRouting.getParentShardId() == null) {
                     assert retentionLeases.contains(getPeerRecoveryRetentionLeaseId(shardRouting))
                         : "no retention lease for tracked shard [" + shardRouting + "] in " + retentionLeases;
                     assert PEER_RECOVERY_RETENTION_LEASE_SOURCE.equals(
@@ -1230,10 +1233,10 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
         return this.latestReplicationCheckpoint;
     }
 
-    private boolean isPrimaryRelocation(String allocationId) {
+    private boolean isPrimaryRelocationOrChild(String allocationId) {
         Optional<ShardRouting> shardRouting = routingTable.shards()
             .stream()
-            .filter(routing -> routing.allocationId().getId().equals(allocationId))
+            .filter(routing -> routing.allocationId().getId().equals(allocationId) || routing.isSplitTarget())
             .findAny();
         return shardRouting.isPresent() && shardRouting.get().primary();
     }
@@ -1247,7 +1250,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
                 // it is possible for a shard to be in-sync but not yet removed from the checkpoints collection after a failover event.
                 if (cps.inSync
                     && replicationGroup.getUnavailableInSyncShards().contains(allocationId) == false
-                    && isPrimaryRelocation(allocationId) == false
+                    && isPrimaryRelocationOrChild(allocationId) == false
                     && latestReplicationCheckpoint.isAheadOf(cps.visibleReplicationCheckpoint)) {
                     cps.checkpointTimers.computeIfAbsent(latestReplicationCheckpoint, ignored -> new SegmentReplicationLagTimer());
                     logger.trace(
@@ -1279,7 +1282,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
                 final CheckpointState cps = e.getValue();
                 if (cps.inSync
                     && replicationGroup.getUnavailableInSyncShards().contains(allocationId) == false
-                    && isPrimaryRelocation(e.getKey()) == false
+                    && isPrimaryRelocationOrChild(e.getKey()) == false
                     && latestReplicationCheckpoint.isAheadOf(cps.visibleReplicationCheckpoint)
                     && cps.checkpointTimers.containsKey(latestReplicationCheckpoint)) {
                     cps.checkpointTimers.get(latestReplicationCheckpoint).start();
@@ -1304,7 +1307,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
                     entry -> entry.getKey().equals(this.shardAllocationId) == false
                         && entry.getValue().inSync
                         && replicationGroup.getUnavailableInSyncShards().contains(entry.getKey()) == false
-                        && isPrimaryRelocation(entry.getKey()) == false
+                        && isPrimaryRelocationOrChild(entry.getKey()) == false
                 )
                 .map(entry -> buildShardStats(entry.getKey(), entry.getValue()))
                 .collect(Collectors.toUnmodifiableSet());
@@ -1435,6 +1438,12 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
             final String primaryTargetAllocationId = primary.relocating()
                 ? primary.getTargetRelocatingShard().allocationId().getId()
                 : null;
+            final Set<String> primaryTargetSplitShardsAllocIds = new HashSet<>();
+            if (primary.splitting()) {
+                for (ShardRouting childShard : primary.getRecoveringChildShards()) {
+                    primaryTargetSplitShardsAllocIds.add(childShard.allocationId().getId());
+                }
+            }
 
             if (primaryMode) {
                 // add new initializingIds that are missing locally. These are fresh shard copies - and not in-sync
@@ -1453,7 +1462,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
                                 globalCheckpoint,
                                 inSync,
                                 inSync,
-                                isReplicated(initializingId, primaryAllocationId, primaryTargetAllocationId)
+                                isReplicated(initializingId, primaryAllocationId, primaryTargetAllocationId, primaryTargetSplitShardsAllocIds)
                             )
                         );
                     }
@@ -1472,7 +1481,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
                             globalCheckpoint,
                             false,
                             false,
-                            isReplicated(initializingId, primaryAllocationId, primaryTargetAllocationId)
+                            isReplicated(initializingId, primaryAllocationId, primaryTargetAllocationId, primaryTargetSplitShardsAllocIds)
                         )
                     );
                 }
@@ -1486,7 +1495,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
                             globalCheckpoint,
                             true,
                             true,
-                            isReplicated(inSyncId, primaryAllocationId, primaryTargetAllocationId)
+                            isReplicated(inSyncId, primaryAllocationId, primaryTargetAllocationId, primaryTargetSplitShardsAllocIds)
                         )
                     );
                 }
@@ -1511,13 +1520,15 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
      * @param primaryTargetAllocationId primary target allocation id
      * @return the replication mode.
      */
-    private boolean isReplicated(String allocationId, String primaryAllocationId, String primaryTargetAllocationId) {
+    private boolean isReplicated(String allocationId, String primaryAllocationId, String primaryTargetAllocationId,
+                                 Set<String> primaryTargetSplitShardsAllocIds) {
         // If remote translog is enabled, then returns replication mode checking current allocation id against the
         // primary and primary target allocation id.
         // If remote translog is enabled, then returns true if given allocation id matches the primary or it's relocation target allocation
         // id.
         if (indexSettings().isRemoteTranslogStoreEnabled()) {
-            return (allocationId.equals(primaryAllocationId) || allocationId.equals(primaryTargetAllocationId));
+            return (allocationId.equals(primaryAllocationId) || allocationId.equals(primaryTargetAllocationId) ||
+                primaryTargetSplitShardsAllocIds.contains(allocationId));
         }
         // For other case which is local translog, return true as the requests are replicated to all shards in the replication group.
         return true;
@@ -1560,6 +1571,28 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
     }
 
     /**
+     * Called when the recovery process for a shard has opened the engine on target child shards. Ensures that the right data structures
+     * have been set up locally to track local checkpoint information for the shards and that the shards are added to the replication group.
+     *
+     * @param allocationIds  the allocation IDs of child shards for which recovery was initiated
+     */
+    public synchronized void initiateTrackingOfChildShards(final List<String> allocationIds) {
+        assert invariant();
+        assert primaryMode;
+        assert handoffInProgress == false;
+        allocationIds.forEach(allocationId -> {
+            CheckpointState cps = checkpoints.get(allocationId);
+            if (cps == null) {
+                // can happen if replica was removed from cluster but recovery process is unaware of it yet
+                throw new IllegalStateException("no local checkpoint tracking information available");
+            }
+            cps.tracked = true;
+        });
+        updateReplicationGroupAndNotify();
+        assert invariant();
+    }
+
+    /**
      * Marks the shard with the provided allocation ID as in-sync with the primary shard. This method will block until the local checkpoint
      * on the specified shard advances above the current global checkpoint.
      *
@@ -1592,12 +1625,14 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
             + getGlobalCheckpoint()
             + " or it's not replicated";
         if (cps.replicated && cps.localCheckpoint < getGlobalCheckpoint()) {
+            logger.info("Waiting for sync as local checkpoint " + cps.localCheckpoint + " is less than global checkpoint " + getGlobalCheckpoint());
             pendingInSync.add(allocationId);
             try {
                 while (true) {
                     if (pendingInSync.contains(allocationId)) {
                         waitForLocalCheckpointToAdvance();
                     } else {
+                        logger.info("Wait over for sync as local checkpoint " + cps.localCheckpoint + " is less than global checkpoint " + getGlobalCheckpoint());
                         break;
                     }
                 }
@@ -1622,7 +1657,6 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
             + allocationId
             + "]";
         if (localCheckpoint > cps.localCheckpoint) {
-            logger.trace("updated local checkpoint of [{}] from [{}] to [{}]", allocationId, cps.localCheckpoint, localCheckpoint);
             cps.localCheckpoint = localCheckpoint;
             return true;
         } else {
@@ -1674,14 +1708,15 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
      */
     private static long computeGlobalCheckpoint(
         final Set<String> pendingInSync,
-        final Collection<CheckpointState> localCheckpoints,
+        final Map<String, CheckpointState> localCheckpoints,
         final long fallback
     ) {
         long minLocalCheckpoint = Long.MAX_VALUE;
         if (pendingInSync.isEmpty() == false) {
             return fallback;
         }
-        for (final CheckpointState cps : localCheckpoints) {
+        for (final String allocationId : localCheckpoints.keySet()) {
+            final CheckpointState cps = localCheckpoints.get(allocationId);
             if (cps.inSync && cps.replicated) {
                 if (cps.localCheckpoint == SequenceNumbers.UNASSIGNED_SEQ_NO) {
                     // unassigned in-sync replica
@@ -1700,7 +1735,7 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
      */
     private synchronized void updateGlobalCheckpointOnPrimary() {
         assert primaryMode;
-        final long computedGlobalCheckpoint = computeGlobalCheckpoint(pendingInSync, checkpoints.values(), getGlobalCheckpoint());
+        final long computedGlobalCheckpoint = computeGlobalCheckpoint(pendingInSync, checkpoints, getGlobalCheckpoint());
         assert computedGlobalCheckpoint >= globalCheckpoint : "new global checkpoint ["
             + computedGlobalCheckpoint
             + "] is lower than previous one ["
@@ -1716,15 +1751,19 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
     /**
      * Initiates a relocation handoff and returns the corresponding primary context.
      */
-    public synchronized PrimaryContext startRelocationHandoff(String targetAllocationId) {
+    public synchronized PrimaryContext startRelocationHandoff(Set<String> targetAllocationIds) {
         assert invariant();
         assert primaryMode;
         assert handoffInProgress == false;
         assert pendingInSync.isEmpty() : "relocation handoff started while there are still shard copies pending in-sync: " + pendingInSync;
-        if (checkpoints.containsKey(targetAllocationId) == false) {
-            // can happen if the relocation target was removed from cluster but the recovery process isn't aware of that.
-            throw new IllegalStateException("relocation target [" + targetAllocationId + "] is no longer part of the replication group");
-        }
+
+        targetAllocationIds.forEach(targetAllocationId -> {
+            if (checkpoints.containsKey(targetAllocationId) == false) {
+                // can happen if the relocation target was removed from cluster but the recovery process isn't aware of that.
+                throw new IllegalStateException("relocation target [" + targetAllocationId + "] is no longer part of the replication group");
+            }
+        });
+
         handoffInProgress = true;
         // copy clusterStateVersion and checkpoints and return
         // all the entries from checkpoints that are inSync: the reason we don't need to care about initializing non-insync entries
@@ -1784,14 +1823,51 @@ public class ReplicationTracker extends AbstractIndexShardComponent implements L
             throw new IllegalStateException("primary context [" + primaryContext + "] does not contain " + shardAllocationId);
         }
         final Runnable runAfter = getClusterManagerUpdateOperationFromCurrentState();
+        logger.info("Activating with primary context");
         primaryMode = true;
         // capture current state to possibly replay missed cluster state update
         appliedClusterStateVersion = primaryContext.clusterStateVersion();
         checkpoints.clear();
-        for (Map.Entry<String, CheckpointState> entry : primaryContext.checkpoints.entrySet()) {
-            checkpoints.put(entry.getKey(), entry.getValue().copy());
+        // During relocation handoff, we get parent routing table here and therefore, we need to exclude
+        // other child shards from being added to replication group.
+        IndexShardRoutingTable contextRoutingTable = primaryContext.getRoutingTable();
+        Set<String> childShardAllocations = new HashSet<>();
+        IndexShardRoutingTable.Builder childRoutingTable = null;
+        boolean childShardActivation = false;
+        if (contextRoutingTable.primaryShard().splitting()) {
+            ShardRouting[] allChildShardRoutings = contextRoutingTable.primaryShard().getRecoveringChildShards();
+            for (ShardRouting childRouting : allChildShardRoutings) {
+                if (childRouting.primary()) {
+                    childRouting = childRouting.moveToStarted();
+                }
+                if (childRouting.shardId().equals(shardId)) {
+                    if (childRoutingTable == null) {
+                         childRoutingTable = new IndexShardRoutingTable.Builder(shardId);
+                    }
+                    childShardAllocations.add(childRouting.allocationId().getId());
+                    childRoutingTable.addShard(childRouting);
+                }
+                if (shardAllocationId.equals(childRouting.allocationId().getId())) {
+                    childShardActivation = true;
+                }
+            }
         }
-        routingTable = primaryContext.getRoutingTable();
+
+        if (childShardActivation == false) {
+            routingTable = primaryContext.getRoutingTable();
+        } else {
+            assert childRoutingTable != null;
+            routingTable = childRoutingTable.build();
+        }
+
+        for (Map.Entry<String, CheckpointState> entry : primaryContext.checkpoints.entrySet()) {
+            if (childShardActivation == false) {
+                checkpoints.put(entry.getKey(), entry.getValue().copy());
+            } else if (childShardAllocations.contains(entry.getKey())) {
+                checkpoints.put(entry.getKey(), entry.getValue().copy());
+            }
+        }
+
         updateReplicationGroupAndNotify();
         updateGlobalCheckpointOnPrimary();
         // reapply missed cluster state update

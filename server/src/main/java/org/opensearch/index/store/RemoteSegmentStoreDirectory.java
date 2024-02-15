@@ -25,6 +25,7 @@ import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.Version;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.annotation.PublicApi;
+import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.io.VersionedCodecStreamWrapper;
 import org.opensearch.common.logging.Loggers;
@@ -45,6 +46,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.NoSuchFileException;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -69,7 +71,6 @@ import java.util.stream.Collectors;
  *
  * @opensearch.api
  */
-@PublicApi(since = "2.3.0")
 public final class RemoteSegmentStoreDirectory extends FilterDirectory implements RemoteStoreCommitLevelLockManager {
 
     /**
@@ -208,7 +209,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         return remoteSegmentMetadata;
     }
 
-    private RemoteSegmentMetadata readMetadataFile(String metadataFilename) throws IOException {
+    public RemoteSegmentMetadata readMetadataFile(String metadataFilename) throws IOException {
         try (InputStream inputStream = remoteMetadataDirectory.getBlobStream(metadataFilename)) {
             byte[] metadataBytes = inputStream.readAllBytes();
             return metadataStreamWrapper.readStream(new ByteArrayIndexInput(metadataFilename, metadataBytes));
@@ -372,8 +373,14 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      */
     @Override
     public String[] listAll() throws IOException {
-        return readLatestMetadataFile().getMetadata().keySet().toArray(new String[0]);
+        RemoteSegmentMetadata metadata = readLatestMetadataFile();
+        if (metadata != null) {
+            return metadata.getMetadata().keySet().toArray(new String[0]);
+        }
+        return null;
     }
+
+
 
     /**
      * Delete segment file from remote segment store.
@@ -387,6 +394,39 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         if (remoteFilename != null) {
             remoteDataDirectory.deleteFile(remoteFilename);
             segmentsUploadedToRemoteStore.remove(name);
+        }
+    }
+
+    /**
+     * Copies segment files from source remote data directory to current remote. If async transfer is not supported
+     * then it uploads files from local directory.
+     */
+    public void copySegmentFilesFromSource(
+        Set<String> fileNames, Directory localDirectory,
+        RemoteSegmentStoreDirectory sourceRemoteDir,
+        RemoteSegmentMetadata sourceMetadata
+    ) throws IOException {
+        Set<String> remoteFileNames = new HashSet<>(fileNames.size());
+        for (String localFile : fileNames) {
+            if (sourceMetadata.getMetadata().get(localFile) != null) {
+                remoteFileNames.add(sourceMetadata.getMetadata().get(localFile).uploadedFilename);
+            }
+        }
+
+        Set<String> toUploadFromLocal = new HashSet<>();
+        Set<String> copiedFiles = remoteDataDirectory.copyFilesFromSrcRemoteToCurRemote(sourceRemoteDir.remoteDataDirectory, remoteFileNames);
+        for (String localFile : fileNames) {
+            UploadedSegmentMetadata uploadedSegmentMetadata = sourceMetadata.getMetadata().get(localFile);
+            if (uploadedSegmentMetadata != null && copiedFiles.contains(uploadedSegmentMetadata.uploadedFilename) == true) {
+                postUpload(localDirectory, localFile, sourceMetadata.getMetadata().get(localFile).uploadedFilename,
+                    getChecksumOfLocalFile(localDirectory, localFile));
+            } else {
+                toUploadFromLocal.add(localFile);
+            }
+        }
+
+        for (String file : toUploadFromLocal) {
+            copyFrom(localDirectory, file, file, IOContext.DEFAULT);
         }
     }
 
@@ -522,10 +562,11 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
     }
 
     // Visible for testing
-    String getMetadataFileForCommit(long primaryTerm, long generation) throws IOException {
-        List<String> metadataFiles = remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
+    public String getMetadataFileForCommit(long primaryTerm, long generation) throws IOException {
+        List<String> metadataFiles = remoteMetadataDirectory.listFilesByPrefixInOrder(
             MetadataFilenameUtils.getMetadataFilePrefixForCommit(primaryTerm, generation),
-            1
+            1,
+            BlobContainer.BlobNameSortOrder.CHRONOLOGICAL
         );
 
         if (metadataFiles.isEmpty()) {
@@ -863,15 +904,19 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         }
 
         try {
-            remoteDataDirectory.delete();
-            remoteMetadataDirectory.delete();
-            mdLockManager.delete();
+            cleanUpRemoteDirectories();
         } catch (Exception e) {
             logger.error("Exception occurred while deleting directory", e);
             return false;
         }
 
         return true;
+    }
+
+    public void cleanUpRemoteDirectories() throws IOException {
+        remoteDataDirectory.delete();
+        remoteMetadataDirectory.delete();
+        mdLockManager.delete();
     }
 
     @Override

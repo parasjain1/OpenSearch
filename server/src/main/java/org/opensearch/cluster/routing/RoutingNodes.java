@@ -37,6 +37,7 @@ import org.apache.lucene.util.CollectionUtil;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.ShardRange;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.UnassignedInfo.AllocationStatus;
 import org.opensearch.cluster.routing.allocation.ExistingShardsAllocator;
@@ -92,6 +93,8 @@ public class RoutingNodes implements Iterable<RoutingNode> {
 
     private final Map<ShardId, List<ShardRouting>> assignedShards = new HashMap<>();
 
+    private final List<ShardRouting> splittingShards = new ArrayList<>();
+
     private final boolean readOnly;
 
     private int inactivePrimaryCount = 0;
@@ -99,6 +102,7 @@ public class RoutingNodes implements Iterable<RoutingNode> {
     private int inactiveShardCount = 0;
 
     private int relocatingShards = 0;
+    private int splittingShardsCount = 0;
 
     private final Map<String, Set<String>> nodesPerAttributeNames;
     private final Map<String, Recoveries> recoveriesPerNode = new HashMap<>();
@@ -150,12 +154,41 @@ public class RoutingNodes implements Iterable<RoutingNode> {
                             addInitialRecovery(targetShardRouting, indexShard.primary);
                             routingNode.add(targetShardRouting);
                             assignedShardsAdd(targetShardRouting);
+                        } else if (shard.splitting()) {
+                            splittingShardsCount++;
+                            for (ShardRouting childShard : shard.getRecoveringChildShards()) {
+                                // Replication source is parent primary in case of both child shards and their replicas.
+                                if (childShard.started() == false) {
+                                    addInitialRecovery(childShard, indexShard.primary);
+                                } else {
+                                    // Only replicas can start first if a portion of recovering child shards is seen started.
+                                    assert childShard.primary() == false;
+                                }
+                                if (childShard.primary()) {
+                                    routingNode.add(childShard);
+                                } else {
+                                    RoutingNode replicaRoutingNode = nodesToShards.computeIfAbsent(
+                                        childShard.currentNodeId(),
+                                        k -> new RoutingNode(childShard.currentNodeId(), clusterState.nodes().get(childShard.currentNodeId()))
+                                    );
+                                    replicaRoutingNode.add(childShard);
+                                }
+                                assignedShardsAdd(childShard);
+                            }
+                            updateSplitSourceOutgoingRecovery(shard, true);
                         } else if (shard.initializing()) {
                             if (shard.primary()) {
                                 inactivePrimaryCount++;
                             }
                             inactiveShardCount++;
                             addInitialRecovery(shard, indexShard.primary);
+                        } else if (shard.started() && shard.primary()) {
+                            IndexMetadata indexMetadata = metadata.getIndexSafe(indexRoutingTable.getIndex());
+                            if (indexMetadata.getSplitShardsMetadata().isSplitOfShardInProgress(shard.id())) {
+                                ShardRange[] childShardRanges = indexMetadata.getSplitShardsMetadata().getChildShardsOfParent(shard.shardId().id());
+                                ShardRouting parentRouting = shard.createRecoveringChildShards(childShardRanges, indexMetadata.getNumberOfReplicas());
+                                splittingShards.add(parentRouting);
+                            }
                         }
                     } else {
                         unassignedShards.add(shard);
@@ -166,26 +199,30 @@ public class RoutingNodes implements Iterable<RoutingNode> {
     }
 
     private void addRecovery(ShardRouting routing) {
-        updateRecoveryCounts(routing, true, findAssignedPrimaryIfPeerRecovery(routing));
+        updateRecoveryCounts(routing, true, findAssignedPrimaryIfPeerRecoveryOrSplit(routing));
     }
 
     private void removeRecovery(ShardRouting routing) {
-        updateRecoveryCounts(routing, false, findAssignedPrimaryIfPeerRecovery(routing));
+        updateRecoveryCounts(routing, false, findAssignedPrimaryIfPeerRecoveryOrSplit(routing));
     }
 
     private void addInitialRecovery(ShardRouting routing, ShardRouting initialPrimaryShard) {
         updateRecoveryCounts(routing, true, initialPrimaryShard);
     }
 
-    private void updateRecoveryCounts(final ShardRouting routing, final boolean increment, @Nullable final ShardRouting primary) {
+    private void updateSplitSourceOutgoingRecovery(ShardRouting splitSource, final boolean increment) {
+        final int howMany = increment ? 1 : -1;
+        Recoveries.getOrAdd(getRecoveries(splitSource), splitSource.currentNodeId()).addOutgoing(howMany);
+    }
 
+    private void updateRecoveryCounts(final ShardRouting routing, final boolean increment, @Nullable final ShardRouting primary) {
         final int howMany = increment ? 1 : -1;
         assert routing.initializing() : "routing must be initializing: " + routing;
         // TODO: check primary == null || primary.active() after all tests properly add ReplicaAfterPrimaryActiveAllocationDecider
         assert primary == null || primary.assignedToNode() : "shard is initializing but its primary is not assigned to a node";
 
-        // Primary shard routing, excluding the relocating primaries.
-        if (routing.primary() && (primary == null || primary == routing)) {
+        // Primary shard routing, excluding the relocating/splitting primaries in the following if condition.
+        if (routing.primary() && (primary == null || (primary == routing))) {
             assert routing.relocatingNodeId() == null : "Routing must be a non relocating primary";
             Recoveries.getOrAdd(initialPrimaryRecoveries, routing.currentNodeId()).addIncoming(howMany);
             return;
@@ -193,7 +230,7 @@ public class RoutingNodes implements Iterable<RoutingNode> {
 
         Recoveries.getOrAdd(getRecoveries(routing), routing.currentNodeId()).addIncoming(howMany);
 
-        if (routing.recoverySource().getType() == RecoverySource.Type.PEER) {
+        if (routing.recoverySource().getType() == RecoverySource.Type.PEER && !routing.isSplitTarget()) {
             // add/remove corresponding outgoing recovery on node with primary shard
             if (primary == null) {
                 throw new IllegalStateException("shard is peer recovering but primary is unassigned");
@@ -252,7 +289,7 @@ public class RoutingNodes implements Iterable<RoutingNode> {
     }
 
     @Nullable
-    private ShardRouting findAssignedPrimaryIfPeerRecovery(ShardRouting routing) {
+    private ShardRouting findAssignedPrimaryIfPeerRecoveryOrSplit(ShardRouting routing) {
         ShardRouting primary = null;
         if (routing.recoverySource() != null && routing.recoverySource().getType() == RecoverySource.Type.PEER) {
             List<ShardRouting> shardRoutings = assignedShards.get(routing.shardId());
@@ -264,6 +301,27 @@ public class RoutingNodes implements Iterable<RoutingNode> {
                         } else if (primary == null) {
                             primary = shardRouting;
                         } else if (primary.relocatingNodeId() != null) {
+                            primary = shardRouting;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (primary != null) {
+            return primary;
+        }
+
+        if (routing.isSplitTarget()) {
+            List<ShardRouting> shardRoutings = assignedShards.get(routing.getParentShardId());
+            if (shardRoutings != null) {
+                for (ShardRouting shardRouting : shardRoutings) {
+                    if (shardRouting.primary()) {
+                        if (shardRouting.active()) {
+                            return shardRouting;
+                        } else if (primary == null) {
+                            primary = shardRouting;
+                        } else if (primary.getRecoveringChildShards() != null) {
                             primary = shardRouting;
                         }
                     }
@@ -285,6 +343,10 @@ public class RoutingNodes implements Iterable<RoutingNode> {
 
     public UnassignedShards unassigned() {
         return this.unassignedShards;
+    }
+
+    public List<ShardRouting> splitting() {
+        return this.splittingShards;
     }
 
     public RoutingNode node(String nodeId) {
@@ -330,6 +392,10 @@ public class RoutingNodes implements Iterable<RoutingNode> {
 
     public int getRelocatingShardCount() {
         return relocatingShards;
+    }
+
+    public int getSplittingShardCount() {
+        return splittingShardsCount;
     }
 
     /**
@@ -545,6 +611,108 @@ public class RoutingNodes implements Iterable<RoutingNode> {
     }
 
     /**
+     * Update assigned child shards against the current splitting parent and their respective recoveries.
+     */
+    public void assignChildShards(
+        ShardRouting startedShard,
+        ShardRouting parentShard,
+        RoutingChangesObserver changes,
+        Map<ShardRouting, String> assignedRoutingNodes
+    ) {
+        ensureMutable();
+        assert parentShard.splitting();
+        splittingShardsCount++;
+        List<ShardRouting> assignedChildShards = parentShard.assignChildShards(assignedRoutingNodes);
+        for (ShardRouting assignedChildShard : assignedChildShards) {
+            node(assignedChildShard.currentNodeId()).add(assignedChildShard);
+            assignedShardsAdd(assignedChildShard);
+            addRecovery(assignedChildShard);
+        }
+        updateSplitSourceOutgoingRecovery(parentShard, true);
+        updateAssigned(startedShard, parentShard);
+        changes.splitStarted(startedShard, assignedChildShards);
+    }
+
+    public void startInPlaceChildShards(
+        Logger logger,
+        List<ShardRouting> childShards,
+        IndexMetadata indexMetadata,
+        RoutingChangesObserver routingChangesObserver,
+        RoutingTable routingTable
+    ) {
+        ensureMutable();
+        assert !childShards.isEmpty();
+        ShardRouting parentShard = getByAllocationId(
+            childShards.get(0).getParentShardId(),
+            childShards.get(0).allocationId().getParentAllocationId()
+        );
+        int validShardEvents = 0, invalidShardEvents = 0;
+        for (ShardRouting childShard : childShards) {
+            if (childShard.isSplitTargetOf(parentShard) == false ||
+                (childShard.isStartedChildReplica() == false && childShard.initializing() == false)) {
+                invalidShardEvents++;
+            } else {
+                validShardEvents++;
+            }
+        }
+
+        if (invalidShardEvents != 0) {
+            logger.error(
+                "Invalid shard started event for child shards received. Unknown child found."
+                    + ", Parent shard is valid: ["
+                    + (indexMetadata.getSplitShardsMetadata().isSplitOfShardInProgress(parentShard.shardId().id()) == true)
+                    + "]. Failing all child shards and cancelling split."
+            );
+            // We just need to fail one child shard because failShard ensures that failure of any child shard
+            // fails all child shards and cancels split of source shard.
+            UnassignedInfo unassignedInfo = new UnassignedInfo(UnassignedInfo.Reason.ALLOCATION_FAILED, "");
+            failShard(logger, childShards.get(0), unassignedInfo, indexMetadata, routingChangesObserver);
+            return;
+        }
+
+        int startedChildPrimaries = 0, startedChildReplicas = 0;
+        ShardRouting updatedParent = parentShard;
+        for (ShardRouting childShard : childShards) {
+            if (childShard.primary() == false) {
+                if (childShard.initializing() == true) {
+                    ShardRouting startedChild = started(childShard);
+                    routingChangesObserver.childReplicaStarted(childShard, parentShard, startedChild);
+                    updatedParent = updatedParent.updatedStartedReplicaOnParent(childShard, startedChild);
+                    startedChildReplicas++;
+                }
+            } else {
+                assert childShard.initializing();
+                ShardRouting startedShard = started(childShard);
+                routingChangesObserver.shardStarted(childShard, startedShard);
+                startedChildPrimaries++;
+            }
+        }
+        updateAssigned(parentShard, updatedParent);
+
+        if (startedChildPrimaries == 0) {
+            assert startedChildReplicas > 0;
+        } else {
+            assert startedChildPrimaries == indexMetadata.getSplitShardsMetadata().
+                getChildShardsOfParent(parentShard.shardId().id()).length;
+            assert startedChildReplicas == 0;
+            for (ShardRouting childShard : parentShard.getRecoveringChildShards()) {
+                ShardRouting assignedChild = getByAllocationId(childShard.shardId(), childShard.allocationId().getId());
+                if (assignedChild.isSplitTarget()) {
+                    assert assignedChild.primary() == false;
+                    removeParentFromStartedChild(assignedChild);
+                    assignedChild = getByAllocationId(childShard.shardId(), childShard.allocationId().getId());
+                }
+                assert assignedChild.started() && assignedChild.isSplitTarget() == false;
+            }
+            IndexShardRoutingTable shardRoutingTable = routingTable.shardRoutingTable(parentShard.shardId());
+            for (ShardRouting parent : shardRoutingTable.getShards()) {
+                remove(parent);
+            }
+            routingChangesObserver.splitCompleted(parentShard, indexMetadata);
+        }
+    }
+
+    /**
      * Applies the relevant logic to start an initializing shard.
      * <p>
      * Moves the initializing shard to started. If the shard is a relocation target, also removes the relocation source.
@@ -613,6 +781,7 @@ public class RoutingNodes implements Iterable<RoutingNode> {
      * - If shard is a primary, this also fails initializing replicas.
      * - If shard is an active primary, this also promotes an active replica to primary (if such a replica exists).
      * - If shard is a relocating primary, this also removes the primary relocation target shard.
+     * - If shard is being split, this also removes target child shards.
      * - If shard is a relocating replica, this promotes the replica relocation target to a full initializing replica, removing the
      *   relocation source information. This is possible as peer recovery is always done from the primary.
      * - If shard is a (primary or replica) relocation target, this also clears the relocation information on the source shard.
@@ -626,6 +795,10 @@ public class RoutingNodes implements Iterable<RoutingNode> {
         RoutingChangesObserver routingChangesObserver
     ) {
         ensureMutable();
+        if (failedShard.getParentShardId() != null && getByAllocationId(failedShard.shardId(), failedShard.allocationId().getId()) == null) {
+            // We already removed this child when parent failed.
+            return;
+        }
         assert failedShard.assignedToNode() : "only assigned shards can be failed";
         assert indexMetadata.getIndex().equals(failedShard.index()) : "shard failed for unknown index (shard entry: " + failedShard + ")";
         assert getByAllocationId(failedShard.shardId(), failedShard.allocationId().getId()) == failedShard
@@ -637,7 +810,7 @@ public class RoutingNodes implements Iterable<RoutingNode> {
         logger.debug("{} failing shard {} with unassigned info ({})", failedShard.shardId(), failedShard, unassignedInfo.shortSummary());
 
         // if this is a primary, fail initializing replicas first (otherwise we move RoutingNodes into an inconsistent state)
-        if (failedShard.primary()) {
+        if (failedShard.primary() && failedShard.getParentShardId() == null) {
             List<ShardRouting> assignedShards = assignedShards(failedShard.shardId());
             if (assignedShards.isEmpty() == false) {
                 // copy list to prevent ConcurrentModificationException
@@ -679,11 +852,34 @@ public class RoutingNodes implements Iterable<RoutingNode> {
                 removeRelocationSource(targetShard);
                 routingChangesObserver.relocationSourceRemoved(targetShard);
             }
+        } else if (failedShard.splitting()) {
+            for (ShardRouting childShard : failedShard.getRecoveringChildShards()) {
+                assert childShard.getParentShardId() != null;
+                logger.trace("{} is removed due to the failure/cancellation of the source shard", childShard);
+                remove(childShard);
+            }
+            routingChangesObserver.splitFailed(failedShard, indexMetadata);
         }
 
         // fail actual shard
+        if (failedShard.getParentShardId() != null) {
+            ShardRouting parentShard = getByAllocationId(
+                failedShard.getParentShardId(),
+                failedShard.allocationId().getParentAllocationId()
+            );
+
+            if (parentShard.splitting() == true) {
+                childShardFailed(logger, failedShard, unassignedInfo, indexMetadata, routingChangesObserver, parentShard);
+                assert node(failedShard.currentNodeId()).getByShardId(failedShard.shardId()) == null : "failedShard "
+                    + failedShard
+                    + " was matched but wasn't removed";
+            }
+            return;
+        }
+
         if (failedShard.initializing()) {
-            if (failedShard.relocatingNodeId() == null) {
+            AllocationId failedShardAllocId = failedShard.allocationId();
+            if (failedShard.relocatingNodeId() == null && failedShardAllocId.getParentAllocationId() == null) {
                 if (failedShard.primary()) {
                     // promote active replica to primary if active replica exists (only the case for shadow replicas)
                     unassignPrimaryAndPromoteActiveReplicaIfExists(failedShard, unassignedInfo, routingChangesObserver);
@@ -692,7 +888,8 @@ public class RoutingNodes implements Iterable<RoutingNode> {
                     moveToUnassigned(failedShard, unassignedInfo);
                 }
             } else {
-                // The shard is a target of a relocating shard. In that case we only need to remove the target shard and cancel the source
+                // The shard is a target or child of a relocating shard. In that case we only need to remove the target/child shard(s) and
+                // cancel the source
                 // relocation. No shard is left unassigned
                 logger.trace(
                     "{} is a relocation target, resolving source to cancel relocation ({})",
@@ -727,6 +924,30 @@ public class RoutingNodes implements Iterable<RoutingNode> {
         assert node(failedShard.currentNodeId()).getByShardId(failedShard.shardId()) == null : "failedShard "
             + failedShard
             + " was matched but wasn't removed";
+    }
+
+    private void childShardFailed(
+        Logger logger,
+        ShardRouting failedShard,
+        UnassignedInfo unassignedInfo,
+        IndexMetadata indexMetadata,
+        RoutingChangesObserver routingChangesObserver,
+        ShardRouting parentShard
+    ) {
+
+        assert parentShard.isSplitSourceOf(failedShard);
+        logger.trace(
+            "{}, resolved source to [{}]. canceling split ... ({})",
+            failedShard.shardId(),
+            parentShard,
+            unassignedInfo.shortSummary()
+        );
+        cancelSplit(parentShard);
+
+        for (ShardRouting childShard : parentShard.getRecoveringChildShards()) {
+            remove(childShard);
+        }
+        routingChangesObserver.splitFailed(parentShard, indexMetadata);
     }
 
     private void unassignPrimaryAndPromoteActiveReplicaIfExists(
@@ -764,7 +985,7 @@ public class RoutingNodes implements Iterable<RoutingNode> {
      */
     private ShardRouting started(ShardRouting shard) {
         assert shard.initializing() : "expected an initializing shard " + shard;
-        if (shard.relocatingNodeId() == null) {
+        if (shard.relocatingNodeId() == null && !shard.isSplitTarget()) {
             // if this is not a target shard for relocation, we need to update statistics
             inactiveShardCount--;
             if (shard.primary()) {
@@ -772,9 +993,22 @@ public class RoutingNodes implements Iterable<RoutingNode> {
             }
         }
         removeRecovery(shard);
-        ShardRouting startedShard = shard.moveToStarted();
+        ShardRouting startedShard;
+        if (shard.isSplitTarget() && shard.primary() == false) {
+            startedShard = shard.moveChildReplicaToStarted();
+        } else {
+            startedShard = shard.moveToStarted();
+        }
         updateAssigned(shard, startedShard);
         return startedShard;
+    }
+
+
+    private ShardRouting removeParentFromStartedChild(ShardRouting shard) {
+        assert shard.started();
+        ShardRouting parentRemoved = shard.removeParentFromReplica();
+        updateAssigned(shard, parentRemoved);
+        return parentRemoved;
     }
 
     /**
@@ -786,6 +1020,22 @@ public class RoutingNodes implements Iterable<RoutingNode> {
         relocatingShards--;
         ShardRouting cancelledShard = shard.cancelRelocation();
         updateAssigned(shard, cancelledShard);
+        return cancelledShard;
+    }
+
+    /**
+     * Cancels a relocation of a shard that shard must relocating.
+     *
+     * @return the shard after cancelling relocation
+     */
+    private ShardRouting cancelSplit(ShardRouting shard) {
+        splittingShardsCount--;
+        for (ShardRouting splittingShard : splittingShards) {
+            assert splittingShard.shardId().equals(shard.shardId()) == false;
+        }
+        ShardRouting cancelledShard = shard.cancelSplit();
+        updateAssigned(shard, cancelledShard);
+        updateSplitSourceOutgoingRecovery(shard, false);
         return cancelledShard;
     }
 
@@ -812,7 +1062,7 @@ public class RoutingNodes implements Iterable<RoutingNode> {
     private void remove(ShardRouting shard) {
         assert shard.unassigned() == false : "only assigned shards can be removed here (" + shard + ")";
         node(shard.currentNodeId()).remove(shard);
-        if (shard.initializing() && shard.relocatingNodeId() == null) {
+        if (shard.initializing() && shard.relocatingNodeId() == null && !shard.isSplitTarget()) {
             inactiveShardCount--;
             assert inactiveShardCount >= 0;
             if (shard.primary()) {
@@ -820,6 +1070,8 @@ public class RoutingNodes implements Iterable<RoutingNode> {
             }
         } else if (shard.relocating()) {
             shard = cancelRelocation(shard);
+        } else if (shard.splitting()) {
+            shard = cancelSplit(shard);
         }
         assignedShardsRemove(shard);
         if (shard.initializing()) {
@@ -1192,10 +1444,11 @@ public class RoutingNodes implements Iterable<RoutingNode> {
         int inactivePrimaryCount = 0;
         int inactiveShardCount = 0;
         int relocating = 0;
+        int splitting = 0;
         Map<Index, Integer> indicesAndShards = new HashMap<>();
         for (RoutingNode node : routingNodes) {
             for (ShardRouting shard : node) {
-                if (shard.initializing() && shard.relocatingNodeId() == null) {
+                if (shard.initializing() && shard.relocatingNodeId() == null && !shard.isSplitTarget()) {
                     inactiveShardCount++;
                     if (shard.primary()) {
                         inactivePrimaryCount++;
@@ -1203,6 +1456,8 @@ public class RoutingNodes implements Iterable<RoutingNode> {
                 }
                 if (shard.relocating()) {
                     relocating++;
+                } else if (shard.splitting()) {
+                    splitting++;
                 }
                 Integer i = indicesAndShards.get(shard.index());
                 if (i == null) {
@@ -1249,12 +1504,12 @@ public class RoutingNodes implements Iterable<RoutingNode> {
             }
         }
 
-        assertRecoveriesPerNode(routingNodes, routingNodes.initialPrimaryRecoveries, false, x -> isNonRelocatingPrimary(x));
+        assertRecoveriesPerNode(routingNodes, routingNodes.initialPrimaryRecoveries, false, x -> isNonRelocatingOrNonSplittingPrimary(x));
         assertRecoveriesPerNode(
             routingNodes,
             Recoveries.unionRecoveries(routingNodes.recoveriesPerNode, routingNodes.initialReplicaRecoveries),
             true,
-            x -> !isNonRelocatingPrimary(x)
+            x -> !isNonRelocatingOrNonSplittingPrimary(x)
         );
 
         assert unassignedPrimaryCount == routingNodes.unassignedShards.getNumPrimaries() : "Unassigned primaries is ["
@@ -1282,6 +1537,11 @@ public class RoutingNodes implements Iterable<RoutingNode> {
             + "] but expected ["
             + relocating
             + "]";
+        assert routingNodes.getSplittingShardCount() == splitting : "Splitting shards mismatch ["
+            + routingNodes.getSplittingShardCount()
+            + "] but expected ["
+            + splitting
+            + "]";
 
         return true;
     }
@@ -1302,9 +1562,20 @@ public class RoutingNodes implements Iterable<RoutingNode> {
                 for (ShardRouting routing : routingNode) {
                     if (routing.initializing() && incomingCountFilter.apply(routing)) incoming++;
 
-                    if (verifyOutgoingRecoveries && routing.primary() && routing.isRelocationTarget() == false) {
+                    if (verifyOutgoingRecoveries
+                        && routing.primary()
+                        && routing.isRelocationTarget() == false
+                        && routing.isSplitTarget() == false) {
                         for (ShardRouting assigned : routingNodes.assignedShards.get(routing.shardId())) {
                             if (assigned.initializing() && assigned.recoverySource().getType() == RecoverySource.Type.PEER) {
+                                outgoing++;
+                            } else if (assigned.splitting()) {
+                                for (ShardRouting childShardRouting : assigned.getRecoveringChildShards()) {
+                                    assert routingNodes.assignedShards.containsKey(childShardRouting.shardId());
+                                    for (ShardRouting assignedChildShard : routingNodes.assignedShards.get(childShardRouting.shardId())) {
+                                        assert assignedChildShard.getParentShardId().equals(assigned.shardId());
+                                    }
+                                }
                                 outgoing++;
                             }
                         }
@@ -1317,8 +1588,8 @@ public class RoutingNodes implements Iterable<RoutingNode> {
         }
     }
 
-    private static boolean isNonRelocatingPrimary(ShardRouting routing) {
-        return routing.primary() && routing.relocatingNodeId() == null;
+    private static boolean isNonRelocatingOrNonSplittingPrimary(ShardRouting routing) {
+        return routing.primary() && routing.relocatingNodeId() == null && !routing.splitting() && !routing.isSplitTarget();
     }
 
     private void ensureMutable() {

@@ -13,15 +13,20 @@ import org.opensearch.action.StepListener;
 import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.CancellableThreads;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.engine.RecoveryEngineException;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.shard.IndexShard;
+import org.opensearch.index.translog.Translog;
 import org.opensearch.indices.RunUnderPrimaryPermit;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.Transports;
 
+import java.io.Closeable;
 import java.io.IOException;
+import java.util.Collections;
+import java.util.List;
 import java.util.function.Consumer;
 
 /**
@@ -38,9 +43,13 @@ public class RemoteStorePeerRecoverySourceHandler extends RecoverySourceHandler 
         StartRecoveryRequest request,
         int fileChunkSizeInBytes,
         int maxConcurrentFileChunks,
-        int maxConcurrentOperations
+        int maxConcurrentOperations,
+        boolean skipSegmentFilesTransfer,
+        CancellableThreads cancellableThreads,
+        IndexShard parentShard
     ) {
-        super(shard, recoveryTarget, threadPool, request, fileChunkSizeInBytes, maxConcurrentFileChunks, maxConcurrentOperations);
+        super(shard, recoveryTarget, threadPool, request, fileChunkSizeInBytes, maxConcurrentFileChunks, maxConcurrentOperations,
+        skipSegmentFilesTransfer, cancellableThreads, parentShard);
     }
 
     @Override
@@ -51,7 +60,7 @@ public class RemoteStorePeerRecoverySourceHandler extends RecoverySourceHandler 
 
         final StepListener<SendFileResult> sendFileStep = new StepListener<>();
         final StepListener<TimeValue> prepareEngineStep = new StepListener<>();
-        final StepListener<SendSnapshotResult> sendSnapshotStep = new StepListener<>();
+        final StepListener<List<SendSnapshotResult>> sendSnapshotStep = new StepListener<>();
 
         // It is always file based recovery while recovering replicas which are not relocating primary where the
         // underlying indices are backed by remote store for storing segments and translog
@@ -89,17 +98,41 @@ public class RemoteStorePeerRecoverySourceHandler extends RecoverySourceHandler 
         prepareEngineStep.whenComplete(prepareEngineTime -> {
             logger.debug("prepareEngineStep completed");
             assert Transports.assertNotTransportThread(this + "[phase2]");
+            IndexShard primaryTracker = replicationTrackingShard();
             RunUnderPrimaryPermit.run(
-                () -> shard.initiateTracking(request.targetAllocationId()),
-                shardId + " initiating tracking of " + request.targetAllocationId(),
-                shard,
+                () -> primaryTracker.initiateTracking(request.targetAllocationId()),
+                primaryTracker + " initiating tracking of " + request.targetAllocationId(),
+                primaryTracker,
                 cancellableThreads,
                 logger
             );
             final long endingSeqNo = shard.seqNoStats().getMaxSeqNo();
-            sendSnapshotStep.onResponse(new SendSnapshotResult(endingSeqNo, 0, TimeValue.ZERO));
+            sendSnapshotStep.onResponse(Collections.singletonList(new SendSnapshotResult(endingSeqNo,
+                0, TimeValue.ZERO, request.targetAllocationId())));
         }, onFailure);
 
-        finalizeStepAndCompleteFuture(startingSeqNo, sendSnapshotStep, sendFileStep, prepareEngineStep, onFailure);
+        finalizeStepAndCompleteFuture(startingSeqNo, sendSnapshotStep, sendFileStep, prepareEngineStep, new StepListener<>(), onFailure);
     }
+
+
+    @Override
+    public int countNumberOfHistoryOperations(long startingSeqNo) throws IOException {
+        return 0;
+    }
+
+    @Override
+    public Closeable acquireRetentionLock() {
+        return null;
+    }
+
+    @Override
+    public Translog.Snapshot phase2Snapshot(long startingSeqNo, String recoveryName){
+        return null;
+    }
+
+    @Override
+    public boolean shouldSkipCreateRetentionLeaseStep() {
+        return true;
+    }
+
 }

@@ -71,6 +71,7 @@ import org.opensearch.cluster.metadata.IndexTemplateMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataCreateDataStreamService;
 import org.opensearch.cluster.metadata.MetadataCreateIndexService;
+import org.opensearch.cluster.metadata.MetadataInPlaceShardSplitService;
 import org.opensearch.cluster.metadata.MetadataIndexUpgradeService;
 import org.opensearch.cluster.metadata.SystemIndexMetadataUpgradeService;
 import org.opensearch.cluster.metadata.TemplateUpgradeService;
@@ -157,6 +158,7 @@ import org.opensearch.indices.analysis.AnalysisModule;
 import org.opensearch.indices.breaker.BreakerSettings;
 import org.opensearch.indices.breaker.HierarchyCircuitBreakerService;
 import org.opensearch.indices.cluster.IndicesClusterStateService;
+import org.opensearch.indices.recovery.inplacesplit.InPlaceShardSplitRecoveryService;
 import org.opensearch.indices.recovery.PeerRecoverySourceService;
 import org.opensearch.indices.recovery.PeerRecoveryTargetService;
 import org.opensearch.indices.recovery.RecoverySettings;
@@ -851,6 +853,15 @@ public class Node implements Closeable {
                 forbidPrivateIndexSettings,
                 awarenessReplicaBalance
             );
+            final MetadataInPlaceShardSplitService metadataInPlaceShardSplitService = new MetadataInPlaceShardSplitService(
+                settings,
+                clusterService,
+                pluginsService,
+                indicesService,
+                clusterModule.getAllocationService(),
+                shardLimitValidator,
+                awarenessReplicaBalance
+            );
             pluginsService.filterPlugins(Plugin.class)
                 .forEach(
                     p -> p.getAdditionalIndexSettingProviders().forEach(metadataCreateIndexService::addAdditionalIndexSettingProvider)
@@ -1228,6 +1239,7 @@ public class Node implements Closeable {
                 b.bind(RemoteStoreStatsTrackerFactory.class).toInstance(remoteStoreStatsTrackerFactory);
                 b.bind(AliasValidator.class).toInstance(aliasValidator);
                 b.bind(MetadataCreateIndexService.class).toInstance(metadataCreateIndexService);
+                b.bind(MetadataInPlaceShardSplitService.class).toInstance(metadataInPlaceShardSplitService);
                 b.bind(AwarenessReplicaBalance.class).toInstance(awarenessReplicaBalance);
                 b.bind(MetadataCreateDataStreamService.class).toInstance(metadataCreateDataStreamService);
                 b.bind(SearchService.class).toInstance(searchService);
@@ -1245,8 +1257,11 @@ public class Node implements Closeable {
                 b.bind(Discovery.class).toInstance(discoveryModule.getDiscovery());
                 {
                     processRecoverySettings(settingsModule.getClusterSettings(), recoverySettings);
+                    InPlaceShardSplitRecoveryService splitRecoveryService = newInPlaceShardSplitRecoveryService(
+                        indicesService, recoverySettings);
+                    b.bind(InPlaceShardSplitRecoveryService.class).toInstance(splitRecoveryService);
                     b.bind(PeerRecoverySourceService.class)
-                        .toInstance(new PeerRecoverySourceService(transportService, indicesService, recoverySettings));
+                        .toInstance(new PeerRecoverySourceService(transportService, indicesService, recoverySettings, splitRecoveryService));
                     b.bind(PeerRecoveryTargetService.class)
                         .toInstance(new PeerRecoveryTargetService(threadPool, transportService, recoverySettings, clusterService));
                     b.bind(SegmentReplicationTargetService.class)
@@ -1262,6 +1277,7 @@ public class Node implements Closeable {
                         );
                     b.bind(SegmentReplicationSourceService.class)
                         .toInstance(new SegmentReplicationSourceService(indicesService, transportService, recoverySettings));
+
                 }
                 b.bind(HttpServerTransport.class).toInstance(httpServerTransport);
                 pluginComponents.stream().forEach(p -> b.bind((Class) p.getClass()).toInstance(p));
@@ -1308,6 +1324,7 @@ public class Node implements Closeable {
             );
             resourcesToClose.addAll(pluginLifecycleComponents);
             resourcesToClose.add(injector.getInstance(PeerRecoverySourceService.class));
+            resourcesToClose.add(injector.getInstance(InPlaceShardSplitRecoveryService.class));
             this.pluginLifecycleComponents = Collections.unmodifiableList(pluginLifecycleComponents);
             DynamicActionRegistry dynamicActionRegistry = actionModule.getDynamicActionRegistry();
             dynamicActionRegistry.registerUnmodifiableActionMap(injector.getInstance(new Key<Map<ActionType, TransportAction>>() {
@@ -1345,6 +1362,11 @@ public class Node implements Closeable {
         Tracer tracer
     ) {
         return new TransportService(settings, transport, threadPool, interceptor, localNodeFactory, clusterSettings, taskHeaders, tracer);
+    }
+
+    protected InPlaceShardSplitRecoveryService newInPlaceShardSplitRecoveryService(
+        IndicesService indicesService, RecoverySettings recoverySettings) {
+        return new InPlaceShardSplitRecoveryService(indicesService, recoverySettings);
     }
 
     protected void processRecoverySettings(ClusterSettings clusterSettings, RecoverySettings recoverySettings) {
@@ -1430,6 +1452,7 @@ public class Node implements Closeable {
         injector.getInstance(PeerRecoverySourceService.class).start();
         injector.getInstance(SegmentReplicationTargetService.class).start();
         injector.getInstance(SegmentReplicationSourceService.class).start();
+        injector.getInstance(InPlaceShardSplitRecoveryService.class).start();
 
         final RemoteClusterStateService remoteClusterStateService = injector.getInstance(RemoteClusterStateService.class);
         if (remoteClusterStateService != null) {
@@ -1618,6 +1641,7 @@ public class Node implements Closeable {
         toClose.add(injector.getInstance(PeerRecoverySourceService.class));
         toClose.add(injector.getInstance(SegmentReplicationSourceService.class));
         toClose.add(injector.getInstance(SegmentReplicationTargetService.class));
+        toClose.add(injector.getInstance(InPlaceShardSplitRecoveryService.class));
         toClose.add(() -> stopWatch.stop().start("cluster"));
         toClose.add(injector.getInstance(ClusterService.class));
         toClose.add(() -> stopWatch.stop().start("node_connections_service"));

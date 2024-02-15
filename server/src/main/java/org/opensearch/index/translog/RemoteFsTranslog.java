@@ -35,7 +35,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -44,6 +46,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 
@@ -62,6 +65,9 @@ public class RemoteFsTranslog extends Translog {
     private final FileTransferTracker fileTransferTracker;
     private final BooleanSupplier startedPrimarySupplier;
     private final RemoteTranslogTransferTracker remoteTranslogTransferTracker;
+    private final BlobStoreRepository blobStoreRepository;
+    private final ThreadPool threadPool;
+    private volatile Map<Integer, TranslogTransferManager> childTranslogTransferManagers;
     private volatile long maxRemoteTranslogGenerationUploaded;
 
     private volatile long minSeqNoToKeep;
@@ -94,12 +100,15 @@ public class RemoteFsTranslog extends Translog {
         BlobStoreRepository blobStoreRepository,
         ThreadPool threadPool,
         BooleanSupplier startedPrimarySupplier,
-        RemoteTranslogTransferTracker remoteTranslogTransferTracker
+        RemoteTranslogTransferTracker remoteTranslogTransferTracker,
+        Function<ShardId, ShardId> splittingParentShardIdSupplier
     ) throws IOException {
         super(config, translogUUID, deletionPolicy, globalCheckpointSupplier, primaryTermSupplier, persistedSequenceNumberConsumer);
         logger = Loggers.getLogger(getClass(), shardId);
         this.startedPrimarySupplier = startedPrimarySupplier;
         this.remoteTranslogTransferTracker = remoteTranslogTransferTracker;
+        this.blobStoreRepository = blobStoreRepository;
+        this.threadPool = threadPool;
         fileTransferTracker = new FileTransferTracker(shardId, remoteTranslogTransferTracker);
         this.translogTransferManager = buildTranslogTransferManager(
             blobStoreRepository,
@@ -109,7 +118,22 @@ public class RemoteFsTranslog extends Translog {
             remoteTranslogTransferTracker
         );
         try {
-            download(translogTransferManager, location, logger);
+//            ShardId parentShardIdOrNull = splittingParentShardIdSupplier.apply(shardId);
+            ShardId parentShardIdOrNull = null;
+            boolean uploadRequired = false;
+            if (parentShardIdOrNull != null) {
+                TranslogTransferManager parentShardTransferManager = buildTranslogTransferManager(
+                    blobStoreRepository,
+                    threadPool,
+                    parentShardIdOrNull,
+                    fileTransferTracker,
+                    remoteTranslogTransferTracker
+                );
+                download(parentShardTransferManager, location, logger);
+                uploadRequired = true;
+            } else {
+                download(translogTransferManager, location, logger);
+            }
             Checkpoint checkpoint = readCheckpoint(location);
             logger.info("Downloaded data from remote translog till maxSeqNo = {}", checkpoint.maxSeqNo);
             this.readers.addAll(recoverFromFiles(checkpoint));
@@ -127,7 +151,11 @@ public class RemoteFsTranslog extends Translog {
                     checkpoint.globalCheckpoint,
                     persistedSequenceNumberConsumer
                 );
-                success = true;
+                if (uploadRequired) {
+                    success = uploadWithSyncPermit(primaryTermSupplier.getAsLong(), current.generation - 1, checkpoint.maxSeqNo);
+                } else {
+                    success = true;
+                }
             } finally {
                 // we have to close all the recovered ones otherwise we leak file handles here
                 // for instance if we have a lot of tlog and we can't create the writer we keep
@@ -255,6 +283,17 @@ public class RemoteFsTranslog extends Translog {
         );
     }
 
+    public void syncFromParentShard(ShardId parentShardId) throws IOException {
+        TranslogTransferManager parentShardTransferManager = buildTranslogTransferManager(
+            blobStoreRepository,
+            threadPool,
+            parentShardId,
+            fileTransferTracker,
+            remoteTranslogTransferTracker
+        );
+        download(parentShardTransferManager, location, logger);
+    }
+
     @Override
     public boolean ensureSynced(Location location) throws IOException {
         assert location.generation <= current.getGeneration();
@@ -333,6 +372,13 @@ public class RemoteFsTranslog extends Translog {
         }
     }
 
+    private boolean uploadWithSyncPermit(long primaryTerm, long generation, long maxSeqNo) throws IOException {
+        if (syncPermit.tryAcquire(SYNC_PERMIT) == false) {
+            return false;
+        }
+        return upload(primaryTerm, generation, maxSeqNo);
+    }
+
     private boolean upload(long primaryTerm, long generation, long maxSeqNo) throws IOException {
         logger.trace("uploading translog for {} {}", primaryTerm, generation);
         try (
@@ -349,6 +395,42 @@ public class RemoteFsTranslog extends Translog {
                 transferSnapshotProvider,
                 new RemoteFsTranslogTransferListener(generation, primaryTerm, maxSeqNo)
             );
+//            if (success == false) {
+//                return false;
+//            }
+//            List<ShardId> childShardIds = getTrackedChildShardIds();
+//            if (childShardIds.isEmpty() == false) {
+//                Map<Integer, TranslogTransferManager> curChildTransferManagers = childTranslogTransferManagers;
+//                if (curChildTransferManagers == null) {
+//                    curChildTransferManagers = new HashMap<>();
+//                }
+//                boolean mutated = false;
+//                for (ShardId childShardId : childShardIds) {
+//                    if (curChildTransferManagers.containsKey(childShardId.id()) == false) {
+//                        curChildTransferManagers.put(childShardId.id(), buildTranslogTransferManager(
+//                            blobStoreRepository,
+//                            threadPool,
+//                            childShardId,
+//                            fileTransferTracker,
+//                            remoteTranslogTransferTracker
+//                        ));
+//                        mutated = true;
+//                    }
+//                }
+//                if (mutated) {
+//                    childTranslogTransferManagers = curChildTransferManagers;
+//                }
+//                for (TranslogTransferManager childTransferManager : curChildTransferManagers.values()) {
+//                    success = childTransferManager.transferSnapshot(
+//                        transferSnapshotProvider,
+//                        new RemoteFsTranslogTransferListener(generation, primaryTerm, maxSeqNo)
+//                    );
+//                    if (success == false) {
+//                        return false;
+//                    }
+//                }
+//            }
+//            return true;
         } finally {
             syncPermit.release(SYNC_PERMIT);
         }

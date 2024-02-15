@@ -32,16 +32,22 @@
 
 package org.opensearch.common.blobstore;
 
+import org.apache.lucene.store.Directory;
 import org.opensearch.core.action.ActionListener;
 
+import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
  * An interface for managing a repository of blob entries, where each blob entry is just a named group of bytes.
@@ -201,7 +207,8 @@ public interface BlobContainer {
      */
     enum BlobNameSortOrder {
 
-        LEXICOGRAPHIC(Comparator.comparing(BlobMetadata::name));
+        LEXICOGRAPHIC(Comparator.comparing(BlobMetadata::name)),
+        CHRONOLOGICAL(Comparator.comparing(BlobMetadata::lastModified)),;
 
         final Comparator<BlobMetadata> comparator;
 

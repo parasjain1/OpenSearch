@@ -197,6 +197,7 @@ public class InternalEngine extends Engine {
     private final AtomicBoolean trackTranslogLocation = new AtomicBoolean(false);
     private final KeyedLock<Long> noOpKeyedLock = new KeyedLock<>();
     private final AtomicBoolean shouldPeriodicallyFlushAfterBigMerge = new AtomicBoolean(false);
+    private final AtomicBoolean refreshesDelayed = new AtomicBoolean();
 
     /**
      * If multiple writes passed {@link InternalEngine#tryAcquireInFlightDocs(Operation, int)} but they haven't adjusted
@@ -372,6 +373,9 @@ public class InternalEngine extends Engine {
         );
         maxSeqNo = seqNoStats.maxSeqNo;
         localCheckpoint = seqNoStats.localCheckpoint;
+        if (shardId.id() > 2) {
+            logger.info("Created local checkpoint tracker with local checkpoint: " + localCheckpoint + " on shard " + shardId.id());
+        }
         logger.trace("recovered maximum sequence number [{}] and local checkpoint [{}]", maxSeqNo, localCheckpoint);
         return localCheckpointTrackerSupplier.apply(maxSeqNo, localCheckpoint);
     }
@@ -915,9 +919,14 @@ public class InternalEngine extends Engine {
                     }
 
                     assert index.seqNo() >= 0 : "ops should have an assigned seq no.; origin: " + index.origin();
-
                     if (plan.indexIntoLucene || plan.addStaleOpToLucene) {
                         indexResult = indexIntoLucene(index, plan);
+//                        if (shardId.id() == 0 && index.origin() == Operation.Origin.PRIMARY) {
+//                            logger.info("Sending operation seq " + index.seqNo());
+//                        }
+//                        if (shardId.id() == 0 && index.origin() == Operation.Origin.PRIMARY) {
+//                            logger.info("Indexing operation seq " + index.seqNo() + " into lucene: " + plan.indexIntoLucene + " index result " + indexResult.getResultType());
+//                        }
                     } else {
                         indexResult = new IndexResult(
                             plan.versionForIndexing,
@@ -932,6 +941,9 @@ public class InternalEngine extends Engine {
                     final Translog.Location location;
                     if (indexResult.getResultType() == Result.Type.SUCCESS) {
                         location = translogManager.add(new Translog.Index(index, indexResult));
+//                        if (shardId.id() == 0 && index.origin() == Operation.Origin.PRIMARY) {
+//                            logger.info("Adding operation seq " + index.seqNo() + " to translog generation " + location.generation);
+//                        }
                     } else if (indexResult.getSeqNo() != SequenceNumbers.UNASSIGNED_SEQ_NO) {
                         // if we have document failure, record it as a no-op in the translog and Lucene with the generated seq_no
                         final NoOp noOp = new NoOp(
@@ -955,6 +967,9 @@ public class InternalEngine extends Engine {
                     );
                 }
                 localCheckpointTracker.markSeqNoAsProcessed(indexResult.getSeqNo());
+                if (indexResult.getSeqNo() == 490 && shardId.id() > 2) {
+                    logger.info("Marking as indexed op in internal engine ");
+                }
                 if (indexResult.getTranslogLocation() == null) {
                     // the op is coming from the translog (and is hence persisted already) or it does not have a sequence number
                     assert index.origin().isFromTranslog() || indexResult.getSeqNo() == SequenceNumbers.UNASSIGNED_SEQ_NO;
@@ -1384,6 +1399,9 @@ public class InternalEngine extends Engine {
                 deleteResult.setTranslogLocation(location);
             }
             localCheckpointTracker.markSeqNoAsProcessed(deleteResult.getSeqNo());
+            if (deleteResult.getSeqNo() == 490 && shardId.id() > 2) {
+                logger.info("Marking as deleted op in internal engine ");
+            }
             if (deleteResult.getTranslogLocation() == null) {
                 // the op is coming from the translog (and is hence persisted already) or does not have a sequence number (version conflict)
                 assert delete.origin().isFromTranslog() || deleteResult.getSeqNo() == SequenceNumbers.UNASSIGNED_SEQ_NO;
@@ -1754,6 +1772,9 @@ public class InternalEngine extends Engine {
     }
 
     final boolean refresh(String source, SearcherScope scope, boolean block) throws EngineException {
+        if (refreshesDelayed.get() == true) {
+            return false;
+        }
         // both refresh types will result in an internal refresh but only the external will also
         // pass the new reader reference to the external reader manager.
         final long localCheckpointBeforeRefresh = localCheckpointTracker.getProcessedCheckpoint();
@@ -2921,6 +2942,9 @@ public class InternalEngine extends Engine {
                 final long primaryTerm = dv.docPrimaryTerm(docId);
                 final long seqNo = dv.docSeqNo(docId);
                 localCheckpointTracker.markSeqNoAsProcessed(seqNo);
+                if (seqNo == 490 && shardId.id() > 2) {
+                    logger.info("Marking in restore with seq: ");
+                }
                 localCheckpointTracker.markSeqNoAsPersisted(seqNo);
                 idFieldVisitor.reset();
                 storedFields.document(docId, idFieldVisitor);

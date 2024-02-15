@@ -239,7 +239,9 @@ public class TransportPitSegmentsAction extends TransportBroadcastByNodeAction<P
                 recoverySource,
                 unassignedInfo,
                 allocationId,
-                expectedShardSize
+                expectedShardSize,
+                null,
+                null
             );
             this.pitId = pitId;
         }

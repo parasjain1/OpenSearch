@@ -45,6 +45,8 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.tests.index.RandomIndexWriter;
 import org.apache.lucene.tests.store.BaseDirectoryWrapper;
+import org.junit.After;
+import org.junit.Before;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.Version;
 import org.opensearch.action.LatchedActionListener;
@@ -102,8 +104,6 @@ import org.opensearch.test.VersionUtils;
 import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
-import org.junit.After;
-import org.junit.Before;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -132,16 +132,9 @@ import java.util.zip.CRC32;
 
 import static java.util.Collections.emptyMap;
 import static java.util.Collections.emptySet;
-import static org.hamcrest.Matchers.containsString;
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.hasSize;
-import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.*;
 import static org.mockito.Mockito.any;
-import static org.mockito.Mockito.anyBoolean;
-import static org.mockito.Mockito.anyString;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.*;
 
 /**
  * This covers test cases for {@link RecoverySourceHandler} and {@link LocalStorePeerRecoverySourceHandler}.
@@ -225,10 +218,13 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             request,
             Math.toIntExact(recoverySettings.getChunkSize().getBytes()),
             between(1, 5),
-            between(1, 5)
+            between(1, 5),
+            false,
+            new CancellableThreads()
         );
         PlainActionFuture<Void> sendFilesFuture = new PlainActionFuture<>();
-        handler.sendFiles(store, metas.toArray(new StoreFileMetadata[0]), () -> 0, sendFilesFuture);
+        IndexCommit snapshot = DirectoryReader.listCommits(dir).get(0);
+        handler.sendFiles(store, metas.toArray(new StoreFileMetadata[0]), () -> 0, sendFilesFuture, snapshot);
         sendFilesFuture.actionGet();
         Store.MetadataSnapshot targetStoreMetadata = targetStore.getMetadata();
         Store.RecoveryDiff recoveryDiff = targetStoreMetadata.recoveryDiff(metadata);
@@ -256,7 +252,8 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             metadataSnapshot,
             randomBoolean(),
             randomNonNegativeLong(),
-            randomBoolean() || metadataSnapshot.getHistoryUUID() == null ? SequenceNumbers.UNASSIGNED_SEQ_NO : randomNonNegativeLong()
+            randomBoolean() || metadataSnapshot.getHistoryUUID() == null ? SequenceNumbers.UNASSIGNED_SEQ_NO : randomNonNegativeLong(),
+            null
         );
     }
 
@@ -306,9 +303,11 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             request,
             fileChunkSizeInBytes,
             between(1, 10),
-            between(1, 10)
+            between(1, 10),
+            false,
+            new CancellableThreads()
         );
-        PlainActionFuture<RecoverySourceHandler.SendSnapshotResult> future = new PlainActionFuture<>();
+        PlainActionFuture<List<RecoverySourceHandler.SendSnapshotResult>> future = new PlainActionFuture<>();
         handler.phase2(
             startingSeqNo,
             endingSeqNo,
@@ -320,7 +319,7 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             future
         );
         final int expectedOps = (int) (endingSeqNo - startingSeqNo + 1);
-        RecoverySourceHandler.SendSnapshotResult result = future.actionGet();
+        RecoverySourceHandler.SendSnapshotResult result = future.actionGet().get(0);
         assertThat(result.sentOperations, equalTo(expectedOps));
         List<Translog.Operation> sortedShippedOps = shippedOps.stream()
             .sorted(Comparator.comparing(Translog.Operation::seqNo))
@@ -369,9 +368,11 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             request,
             fileChunkSizeInBytes,
             between(1, 10),
-            between(1, 10)
+            between(1, 10),
+            false,
+            new CancellableThreads()
         );
-        PlainActionFuture<RecoverySourceHandler.SendSnapshotResult> future = new PlainActionFuture<>();
+        PlainActionFuture<List<RecoverySourceHandler.SendSnapshotResult>> future = new PlainActionFuture<>();
         final long startingSeqNo = randomLongBetween(0, ops.size() - 1L);
         final long endingSeqNo = randomLongBetween(startingSeqNo, ops.size() - 1L);
         handler.phase2(
@@ -429,7 +430,7 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             }
         };
 
-        PlainActionFuture<RecoverySourceHandler.SendSnapshotResult> sendFuture = new PlainActionFuture<>();
+        PlainActionFuture<List<RecoverySourceHandler.SendSnapshotResult>> sendFuture = new PlainActionFuture<>();
         long startingSeqNo = randomIntBetween(0, 1000);
         long endingSeqNo = startingSeqNo + randomIntBetween(0, 10000);
         List<Translog.Operation> operations = generateOperations(numOps);
@@ -443,7 +444,9 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             getStartRecoveryRequest(),
             between(1, 10 * 1024),
             between(1, 5),
-            between(1, 5)
+            between(1, 5),
+            false,
+            new CancellableThreads()
         );
         handler.phase2(
             startingSeqNo,
@@ -455,7 +458,7 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             mappingVersion,
             sendFuture
         );
-        RecoverySourceHandler.SendSnapshotResult sendSnapshotResult = sendFuture.actionGet();
+        RecoverySourceHandler.SendSnapshotResult sendSnapshotResult = sendFuture.actionGet().get(0);
         assertTrue(received.get());
         assertThat(sendSnapshotResult.targetLocalCheckpoint, equalTo(localCheckpoint.get()));
         assertThat(sendSnapshotResult.sentOperations, equalTo(receivedSeqNos.size()));
@@ -562,15 +565,19 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             request,
             Math.toIntExact(recoverySettings.getChunkSize().getBytes()),
             between(1, 8),
-            between(1, 8)
+            between(1, 8),
+            false,
+            new CancellableThreads()
         );
         SetOnce<Exception> sendFilesError = new SetOnce<>();
         CountDownLatch latch = new CountDownLatch(1);
+        IndexCommit snapshot = DirectoryReader.listCommits(dir).get(0);
         handler.sendFiles(
             store,
             metas.toArray(new StoreFileMetadata[0]),
             () -> 0,
-            new LatchedActionListener<>(ActionListener.wrap(r -> sendFilesError.set(null), e -> sendFilesError.set(e)), latch)
+            new LatchedActionListener<>(ActionListener.wrap(r -> sendFilesError.set(null), e -> sendFilesError.set(e)), latch),
+            snapshot
         );
         latch.await();
         assertThat(sendFilesError.get(), instanceOf(IOException.class));
@@ -637,10 +644,13 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             request,
             Math.toIntExact(recoverySettings.getChunkSize().getBytes()),
             between(1, 10),
-            between(1, 4)
+            between(1, 4),
+            false,
+            new CancellableThreads()
         );
         PlainActionFuture<Void> sendFilesFuture = new PlainActionFuture<>();
-        handler.sendFiles(store, metas.toArray(new StoreFileMetadata[0]), () -> 0, sendFilesFuture);
+        IndexCommit snapshot = DirectoryReader.listCommits(dir).get(0);
+        handler.sendFiles(store, metas.toArray(new StoreFileMetadata[0]), () -> 0, sendFilesFuture, snapshot);
         Exception ex = expectThrows(Exception.class, sendFilesFuture::actionGet);
         final IOException unwrappedCorruption = ExceptionsHelper.unwrapCorruption(ex);
         if (throwCorruptedIndexException) {
@@ -690,11 +700,13 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             request,
             Math.toIntExact(recoverySettings.getChunkSize().getBytes()),
             between(1, 8),
-            between(1, 8)
+            between(1, 8),
+            false,
+            new CancellableThreads()
         ) {
 
             @Override
-            void phase1(
+            protected void phase1(
                 IndexCommit snapshot,
                 long startingSeqNo,
                 IntSupplier translogOps,
@@ -706,13 +718,13 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             }
 
             @Override
-            void prepareTargetForTranslog(int totalTranslogOps, ActionListener<TimeValue> listener) {
+            protected void prepareTargetForTranslog(int totalTranslogOps, ActionListener<TimeValue> listener) {
                 prepareTargetForTranslogCalled.set(true);
                 super.prepareTargetForTranslog(totalTranslogOps, listener);
             }
 
             @Override
-            void phase2(
+            protected void phase2(
                 long startingSeqNo,
                 long endingSeqNo,
                 Translog.Snapshot snapshot,
@@ -720,7 +732,7 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
                 long maxSeqNoOfUpdatesOrDeletes,
                 RetentionLeases retentionLeases,
                 long mappingVersion,
-                ActionListener<SendSnapshotResult> listener
+                ActionListener<List<SendSnapshotResult>> listener
             ) throws IOException {
                 phase2Called.set(true);
                 super.phase2(
@@ -802,13 +814,15 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             getStartRecoveryRequest(),
             chunkSize,
             maxConcurrentChunks,
-            between(1, 10)
+            between(1, 10),
+            false,
+            new CancellableThreads()
         );
         Store store = newStore(createTempDir(), false);
         List<StoreFileMetadata> files = generateFiles(store, between(1, 10), () -> between(1, chunkSize * 20));
         int totalChunks = files.stream().mapToInt(md -> ((int) md.length() + chunkSize - 1) / chunkSize).sum();
         PlainActionFuture<Void> sendFilesFuture = new PlainActionFuture<>();
-        handler.sendFiles(store, files.toArray(new StoreFileMetadata[0]), () -> 0, sendFilesFuture);
+        handler.sendFiles(store, files.toArray(new StoreFileMetadata[0]), () -> 0, sendFilesFuture, null);
         assertBusy(() -> {
             assertThat(sentChunks.get(), equalTo(Math.min(totalChunks, maxConcurrentChunks)));
             assertThat(unrepliedChunks, hasSize(sentChunks.get()));
@@ -875,7 +889,9 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             getStartRecoveryRequest(),
             chunkSize,
             maxConcurrentChunks,
-            between(1, 5)
+            between(1, 5),
+            false,
+            new CancellableThreads()
         );
         Store store = newStore(createTempDir(), false);
         List<StoreFileMetadata> files = generateFiles(store, between(1, 10), () -> between(1, chunkSize * 20));
@@ -886,7 +902,8 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             store,
             files.toArray(new StoreFileMetadata[0]),
             () -> 0,
-            new LatchedActionListener<>(ActionListener.wrap(r -> sendFilesError.set(null), e -> sendFilesError.set(e)), sendFilesLatch)
+            new LatchedActionListener<>(ActionListener.wrap(r -> sendFilesError.set(null), e -> sendFilesError.set(e)), sendFilesLatch),
+            null
         );
         assertBusy(() -> assertThat(sentChunks.get(), equalTo(Math.min(totalChunks, maxConcurrentChunks))));
         List<FileChunkResponse> failedChunks = randomSubsetOf(between(1, unrepliedChunks.size()), unrepliedChunks);
@@ -983,7 +1000,9 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             startRecoveryRequest,
             between(1, 16),
             between(1, 4),
-            between(1, 4)
+            between(1, 4),
+            false,
+            new CancellableThreads()
         ) {
             @Override
             void createRetentionLease(long startingSeqNo, ActionListener<RetentionLease> listener) {
@@ -1022,7 +1041,9 @@ public class LocalStorePeerRecoverySourceHandlerTests extends OpenSearchTestCase
             getStartRecoveryRequest(),
             between(1, 16),
             between(1, 4),
-            between(1, 4)
+            between(1, 4),
+            false,
+            new CancellableThreads()
         );
 
         String syncId = UUIDs.randomBase64UUID();
